@@ -1,7 +1,4 @@
-"""
-schemas.py — Pydantic models for the migration-agent pipeline.
-Referenced by state.py. See migration-agent-plan.md for the full architecture.
-"""
+
 
 from __future__ import annotations
 from typing import Optional, Literal
