@@ -1,128 +1,99 @@
-# Migration Agent
+# Code Migration Agent
 
-Multi-agent codebase migration system. Parses a legacy repo, builds a
-dependency-safe task graph, plans a migration strategy per unit, executes
-it chunk-by-chunk with retries and adjudication, validates the result.
-Built as a LangGraph project.
+A checkpointed, multi-agent pipeline that migrates a small Python repository to
+TypeScript. It builds a dependency-safe plan **before** any agent touches code,
+migrates one chunk at a time with bounded retries, verifies each chunk
+deterministically, and can resume after a crash. Built on LangGraph.
 
-**Status: early.** `schemas.py` and `state.py` exist. 
- This README describes the target design so implementation
-has something concrete to build against.
+**Core idea:** never let an LLM change code before the safe order is known.
+Ordering, cycle handling and chunking are plain deterministic algorithms; agents
+only summarize, plan, adjudicate and write code, and everything they return is
+schema-validated and recorded.
 
-## High-Level Design
-
-The pipeline is 9 phases, run roughly in this order (2 pairs run in
-parallel; everything else is sequential):
+## Pipeline
 
 ```
-Phase 0  Indexing              tree-sitter parse -> symbols -> SQLite + MCP server
-Phase 1  Task graph derivation  \_ run in parallel, join before Phase 3
-Phase 2  Knowledge base          /
-Phase 3  Planning + adjudication  planner -> adjudicator (on conflict) -> chunking
-Phase 4  Iterative migration      per-chunk: migrate -> build/retry -> validate -> integrate
-Phase 5  Final parity             repo-wide validation, loopback fixes (capped)
-Phase 6  E2E + documentation      \_ run in parallel, join before Phase 8
-                                    /
-Phase 8  Completion               assemble final report
+Phase 0  Index          parse source -> symbols -> SQLite index
+Phase 1  Task graph     dependency graph -> SCCs (cycles become atomic groups) -> topological order
+Phase 2  Knowledge      one structured summary per symbol
+Phase 3  Planning       strategy per group -> conflict adjudication -> immutable chunks
+Phase 4  Migration      per chunk: migrate -> build -> parity tests -> integration, with retries
+Phase 5  Final parity   repo-wide build + tests, capped fix loopback
+Phase 6  E2E + docs     written in parallel
+Phase 8  Report         what worked, what was blocked, what was skipped
 ```
 
-Phase 7 (idiomatic refactor) is **not built in v1** — skipped entirely,
-not just deferred silently.
+Phase 7 (idiomatic refactoring) is deliberately not implemented.
 
-**Core idea:** not to let an LLM touch code before it knows the safe
-order. Phases 0-1 exist purely to produce that order
-(and to detect where "safe order" doesn't exist — cycles — and merge
-those into atomic units) before any agent starts making changes.
+## Quick start
 
-**Execution model (v1, locked):** per-chunk only. One chunk in flight
-at a time, dispatched off `chunk_queue` in dependency order. No
-wave-barrier mode, no concurrency, no model-tier routing. These are
-simplifications to get a working end-to-end run before adding
-complexity back in.
+```bash
+pip install -r requirements.txt
+python -m pytest -q                      # 72 tests, no API key needed
 
-## Low-Level Design
+pip install anthropic                    # only for real runs
+export ANTHROPIC_API_KEY=...
 
-### schemas.py — data models (built)
+python cli.py dry-run  path/to/repo --target out/    # plan only, writes nothing to out/
+python cli.py run      path/to/repo --target out/    # full migration
+python cli.py status   path/to/repo --target out/    # progress from the checkpoint
+python cli.py resume   path/to/repo --target out/    # continue after an interruption
+```
 
-| Model | Purpose |
+Each run keeps its files under `.migration/<run-id>/`: `plan.json` (dry-run),
+`artifacts/` (every agent prompt, raw reply, parsed output and validation
+failure), `checkpoints.sqlite`, `progress.md`, `run.log`. The source repository
+is never modified. Exit codes: `0` everything passed, `1` finished with blocked
+or failed work, `2` interrupted or refused (continue with `resume`).
+
+The target project needs `tsc` and `vitest` available, because build and parity
+checks run `npx tsc --noEmit` and `npx vitest run` in it.
+
+## How failures are handled
+
+| Situation | Behaviour |
 |---|---|
-| `Symbol` | one function: id, file, signature, line range, `calls` list |
-| `DependencyGraph` | `symbol_id -> [symbol_ids it calls]` |
-| `SCCGroup` | contracted cycle or single unit; `is_cycle` flag |
-| `PlannerStrategy` | one group's proposed migration approach |
-| `AdjudicationResult` | resolves a conflict (Phase 3) or a retry-exhaustion decision (Phase 4); `outcome` is one of `fixed / false_positive / real_gap / inconclusive / resolved` |
-| `Chunk` | final work unit after planning — immutable plan artifact, not execution state |
-| `BuildResult` | pass/fail + error type (`syntax / compile / infra / other`) |
-| `ValidationResult` | pass/fail + error type (`parity / test / lint`) |
-| `IntegrationResult` | per-chunk integration/test outcome |
-| `FinalReport` | Phase 8 output |
+| Agent output fails its schema | recorded, retried once with the error, then treated as a failed attempt |
+| Migrator writes outside its chunk's files | rejected, nothing written, counts as a failed attempt |
+| Build/test fails (code error) | up to 3 agent attempts per chunk, with the error fed back |
+| Build hits an infrastructure error (timeout, missing tool, OOM) | separate counter, up to 2 tries, then a hard failure that halts the run |
+| Attempts exhausted | one adjudication: `fixed` (one extra attempt), `false_positive` (parity only), `real_gap` or `inconclusive` (chunk blocked) |
+| Chunk blocked | run continues; chunks that depend on it are skipped; the run halts at 3 blocked chunks |
+| Final parity fails | up to 2 fix loops, then the failure is reported and e2e/docs are skipped |
 
-### state.py — LangGraph state (built)
+An inconclusive result is never promoted to success. All caps are configurable in
+[`config.py`](config.py).
 
-Execution state (completed/blocked/failed chunk ids, retry counters,
-current chunk) lives here, separately from `Chunk` in schemas.py, which
-stays an immutable plan artifact — the plan doesn't mutate as execution
-runs, only the state does.
+**Parity is deterministic:** a chunk passes only if its own test files exist and
+pass. No tests means no parity claim, which fails.
 
-Key fields:
-- `chunk_queue: list[str]` — dependency-ready chunks, refilled as parents complete
-- `agent_attempts` / `infra_attempts` — **separate dicts**, different caps, different failure branches feed them (compile/syntax vs. lock/OOM/network/timeout)
-- `parity_adjudications: dict[str, AdjudicationOutcome]` — just the outcome literal, not a full `AdjudicationResult`
-- `blocked_chunk_ids` vs `failed_chunk_ids` — blocked doesn't halt the run (up to a cap), failed does
-- `current_phase: int` — for quick resume reporting; full state is checkpointed by LangGraph's `SqliteSaver` regardless
+## Layout
 
-### Config caps (not yet in a config.py — values decided, file not written)
+```
+schemas.py, state.py      data contracts and LangGraph state
+config.py                 language pair, caps, chunk size
+parser/, kb/              Python parser (ast) and SQLite symbol index
+graph_algorithms/         SCC, topological order, chunking (pure, no LangGraph)
+nodes/                    agent nodes, build/parity/integration, routing, final phases
+graph.py                  LangGraph wiring + SQLite checkpointing
+cli.py, report.py         command line and progress report
+llm.py, runner.py         LLM and command seams (real + fake implementations)
+tests/                    unit, loop, graph and CLI tests with a fixture repo
+```
 
-| Cap | Value |
-|---|---|
-| `agent_attempts` per chunk | 3 |
-| `infra_attempts` per chunk | 2 |
-| `max_blocked_chunks` before halting the run | 3 |
-| `final_parity_loop_count` | 2 |
+## Testing
 
-### graph.py — node wiring (not built)
+Everything above the model call is tested offline with a scripted fake LLM and
+fake command runner: the graph algorithms (including shuffled-input
+determinism), each retry branch, the full graph, crash-and-resume (completed
+chunks are not re-run), and the CLI.
 
-Planned nodes:
-- `parse_index` (deterministic) — Phase 0
-- `build_dependency_graph` (deterministic) — Phase 1, runs parallel to `kb_summarizer`
-- `kb_summarizer` (agent) — Phase 2
-- `planner` (agent) — Phase 3, also owns chunking after adjudication clears
-- `adjudicator` (agent) — reused at two call sites: Phase 3 conflict resolution, Phase 4 retry-exhaustion decisions
-- `code_migrator` (agent) — Phase 4 transform step
-- `run_build` (deterministic/tool) — compiles, classifies error type
-- `parity_verifier` (agent) — reused at Phase 4 (per-chunk) and Phase 5 (repo-wide)
-- `integration_test` (deterministic/tool)
-- `dispatch_next_chunk` (deterministic) — pops `chunk_queue`, routes to `code_migrator` or on to Phase 5 when empty
-- `e2e_test_crafter`, `documentation_writer` (agents) — Phase 6, parallel
-- `finalize_report` (deterministic) — Phase 8
+## Limitations
 
-Conditional edges needed: build success/fail routing, agent vs infra
-retry routing, retry-exhaustion → adjudicator, adjudication outcome
-routing (`fixed/false_positive/real_gap/inconclusive`), final-parity
-loopback (capped), blocked-count halt check.
-
-## Not yet built
-
-- `parser/` — tree-sitter walk, symbol extraction, SQLite write
-- `kb/` — SQLite index + in-process MCP server (symbol/summary/edge lookup)
-- `graph/` — dependency graph build, SCC contraction, topo sort, chunking (pure algorithm — should be testable standalone, no LangGraph dependency)
-- `nodes/` — every agent node listed above
-- `graph.py` — actual LangGraph wiring
-- `config.py` — the caps table above, as code
-- Checkpointing wiring (`SqliteSaver`, `thread_id` scheme)
-
-## Build order
-
-1. ~~`schemas.py` + `state.py`~~ — done
-2. `parser/` — get real `Symbol` objects out of a small demo repo
-3. `graph/` — dependency graph + SCC contraction + topo sort + chunking; test standalone before touching LangGraph at all
-4. `kb/` — MCP server over the SQLite index
-5. `nodes/kb_summarizer.py`, `nodes/planner.py`, `nodes/adjudicator.py` — get Phases 2-3 producing real `Chunk`s
-6. `nodes/code_migrator.py`, `nodes/parity_verifier.py` + the retry/adjudication loop — Phase 4 core; get one chunk migrating end-to-end before wiring the full queue
-7. Wire `chunk_queue` dispatch, run the demo repo through all chunks
-8. Phase 5 (reuse `parity_verifier`), Phase 6 (parallel), Phase 8 (`finalize_report`)
-9. `SqliteSaver` checkpointing; test resume by killing the process mid-run
-
-## Scope notes (v1, decided)
-
-One language pair, small demo repo (5-10 files). No wave-barrier mode.
+- One language pair (Python to TypeScript); the parser interface is extensible.
+- Only top-level functions are indexed. Classes, methods, star imports and
+  unparseable files are reported as warnings, not migrated.
+- Chunks run one at a time; no wave scheduling or concurrency.
+- Infrastructure errors are classified for the build step only.
+- The real Claude client has not been exercised end to end; the pipeline is
+  tested against fakes.
